@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import sys
 import time
 from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event
 from typing import Callable, Iterator
 
@@ -15,6 +17,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageGrab
 
+from sudoku_ocr import _digit_patch
 from sudoku_solver import verify_solution
 
 
@@ -33,6 +36,84 @@ class ScreenRegion:
     @property
     def height(self) -> int:
         return self.bottom - self.top
+
+
+@dataclass(frozen=True)
+class SavedSelection:
+    left: int
+    top: int
+    right: int
+    bottom: int
+    screen_width: int
+    screen_height: int
+    window_title: str
+
+    @classmethod
+    def from_region(cls, region: ScreenRegion, screen_size: tuple[int, int],
+                    title: str) -> SavedSelection:
+        return cls(region.left, region.top, region.right, region.bottom,
+                   screen_size[0], screen_size[1], title)
+
+
+def load_selection(path: Path) -> SavedSelection | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return None
+        selection = SavedSelection(*(data[key] for key in (
+            "left", "top", "right", "bottom", "screen_width", "screen_height",
+            "window_title")))
+        numbers = (selection.left, selection.top, selection.right, selection.bottom,
+                   selection.screen_width, selection.screen_height)
+        if (not all(type(value) is int for value in numbers) or
+                not isinstance(selection.window_title, str) or
+                not selection.window_title or
+                not 0 <= selection.left < selection.right <= selection.screen_width or
+                not 0 <= selection.top < selection.bottom <= selection.screen_height):
+            return None
+        return selection
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_selection(path: Path, selection: SavedSelection) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"version": 1, **selection.__dict__}
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def resolve_saved_region(selection: SavedSelection,
+                         image_size: tuple[int, int]) -> ScreenRegion:
+    """Find the selected window at the saved physical cell coordinates."""
+    if image_size != (selection.screen_width, selection.screen_height):
+        raise ValueError("屏幕尺寸已变化，请重新框选数独。")
+    if sys.platform != "win32":
+        raise ValueError("屏幕自动填写目前只支持 Windows。")
+    region = target_at_region(ScreenRegion(selection.left, selection.top,
+                                           selection.right, selection.bottom, 0))
+    if window_title(region.target_hwnd) != selection.window_title:
+        raise ValueError("原数独窗口不在上次位置或被遮挡，请点击『重新框选』。")
+    return region
+
+
+def target_at_region(region: ScreenRegion) -> ScreenRegion:
+    """Identify the visible root window containing the selected board."""
+    if sys.platform != "win32":
+        raise ValueError("屏幕自动填写目前只支持 Windows。")
+    center = wintypes.POINT((region.left + region.right) // 2,
+                            (region.top + region.bottom) // 2)
+    with _physical_dpi() as user32:
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        hwnd = int(user32.GetAncestor(user32.WindowFromPoint(center), 2) or 0)
+        bounds = wintypes.RECT()
+        if (not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(bounds)) or
+                not (bounds.left <= region.left < region.right <= bounds.right and
+                     bounds.top <= region.top < region.bottom <= bounds.bottom)):
+            raise ValueError("原数独窗口不在上次位置或被遮挡，请点击『重新框选』。")
+    return ScreenRegion(region.left, region.top, region.right, region.bottom, hwnd)
 
 
 @dataclass(frozen=True)
@@ -89,6 +170,53 @@ def make_fill_plan(givens: list[int], solution: list[int], region: ScreenRegion,
             raise ValueError("识别出的棋盘边界超出框选范围，请重新框选。")
         actions.append(FillAction(index, solution[index], screen_x, screen_y))
     return actions
+
+
+def missing_fill_actions(image: Image.Image, corners: np.ndarray,
+                         actions: list[FillAction]) -> list[FillAction]:
+    """Check which target cells still have no visible digit after input."""
+    raw = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    target = np.array([[0, 0], [899, 0], [899, 899], [0, 899]], dtype=np.float32)
+    transform = cv2.getPerspectiveTransform(corners.astype(np.float32), target)
+    warped = cv2.warpPerspective(raw, transform, (900, 900), flags=cv2.INTER_CUBIC)
+    missing = []
+    for action in actions:
+        row, col = divmod(action.index, 9)
+        cell = warped[row*100:(row+1)*100, col*100:(col+1)*100]
+        if _digit_patch(cell) is None:
+            missing.append(action)
+    return missing
+
+
+def _enter_and_verify(actions: list[FillAction],
+                      enter_digit: Callable[[FillAction, int, float, float], None],
+                      progress: Callable[[int, int], None],
+                      capture: Callable[[], Image.Image] | None,
+                      corners: np.ndarray | None,
+                      pause: Callable[[float], None] = time.sleep) -> None:
+    for count, action in enumerate(actions, 1):
+        enter_digit(action, count, .13, .13)
+        progress(count, len(actions))
+
+    if capture is None or corners is None:
+        return
+    for retry in range(3):
+        pause(.35)
+        first_check = missing_fill_actions(capture(), corners, actions)
+        if first_check:
+            pause(.25)
+            confirmed = set(missing_fill_actions(capture(), corners, first_check))
+            missing = [action for action in first_check if action in confirmed]
+        else:
+            missing = []
+        if not missing:
+            progress(len(actions), len(actions))
+            return
+        progress(len(actions)-len(missing), len(actions))
+        if retry == 2:
+            raise RuntimeError(f"仍有 {len(missing)} 格未显示数字，请检查目标页面后重试。")
+        for action in missing:
+            enter_digit(action, len(actions)-len(missing)+1, .22, .22)
 
 
 _ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else wintypes.DWORD
@@ -177,7 +305,8 @@ def window_title(hwnd: int) -> str:
 def fill_on_screen(actions: list[FillAction], target_hwnd: int,
                    stopped: Event, progress: Callable[[int, int], None],
                    region: ScreenRegion | None = None,
-                   reference: Image.Image | None = None) -> None:
+                   reference: Image.Image | None = None,
+                   corners: np.ndarray | None = None) -> None:
     if sys.platform != "win32":
         raise RuntimeError("自动填写目前只支持 Windows。")
     if not target_hwnd or not actions:
@@ -197,6 +326,7 @@ def fill_on_screen(actions: list[FillAction], target_hwnd: int,
         if any(not (bounds.left <= action.x < bounds.right and
                     bounds.top <= action.y < bounds.bottom) for action in actions):
             raise FillCancelled("目标窗口位置发生变化，请重新框选数独。")
+        original_bounds = (bounds.left, bounds.top, bounds.right, bounds.bottom)
         for _ in range(30):  # Allow the target window to regain focus.
             if stopped.is_set() or user32.GetAsyncKeyState(0x1B) & 0x8000:
                 raise FillCancelled("已按 Esc 停止自动填写。")
@@ -214,13 +344,19 @@ def fill_on_screen(actions: list[FillAction], target_hwnd: int,
             if float(np.abs(before - after).mean()) > 18:
                 raise FillCancelled("屏幕数独与框选时不同，请重新框选后再试。")
 
-        for count, action in enumerate(actions, 1):
+        def enter_digit(action: FillAction, count: int, click_delay: float,
+                        key_delay: float) -> None:
             if stopped.is_set() or user32.GetAsyncKeyState(0x1B) & 0x8000:
                 raise FillCancelled(f"已停止自动填写，已填 {count-1} 格。")
             if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x01)):
                 raise FillCancelled(f"检测到用户正在操作键盘或鼠标，已填 {count-1} 格。")
             if foreground_window() != target_hwnd:
                 raise FillCancelled(f"目标窗口已切换，已填 {count-1} 格。")
+            current_bounds = wintypes.RECT()
+            if (not user32.GetWindowRect(target_hwnd, ctypes.byref(current_bounds)) or
+                    (current_bounds.left, current_bounds.top,
+                     current_bounds.right, current_bounds.bottom) != original_bounds):
+                raise FillCancelled("目标窗口位置改变，自动填写已停止。")
             at_point = user32.WindowFromPoint(wintypes.POINT(action.x, action.y))
             if user32.GetAncestor(at_point, 2) != target_hwnd:
                 raise FillCancelled(f"目标格子被其他窗口遮挡，已填 {count-1} 格。")
@@ -231,8 +367,11 @@ def fill_on_screen(actions: list[FillAction], target_hwnd: int,
             if abs(point.x - action.x) > 2 or abs(point.y - action.y) > 2:
                 raise RuntimeError("屏幕坐标与鼠标位置不一致，自动填写已停止。")
             _click(user32)
-            time.sleep(.06)
+            time.sleep(click_delay)
             _press_digit(user32, action.digit)
-            progress(count, len(actions))
-            time.sleep(.09)
+            time.sleep(key_delay)
+
+        capture = (lambda: ImageGrab.grab(bbox=(region.left, region.top,
+                                               region.right, region.bottom))) if region else None
+        _enter_and_verify(actions, enter_digit, progress, capture, corners)
 

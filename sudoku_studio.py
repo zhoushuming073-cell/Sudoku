@@ -6,6 +6,7 @@ Run with ``python sudoku_studio.py`` after installing requirements and Tesseract
 from __future__ import annotations
 
 import queue
+import os
 import sys
 import threading
 import tkinter as tk
@@ -15,9 +16,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk
 
-from screen_automation import (FillCancelled, ScreenRegion, fill_on_screen,
-                               foreground_window, make_fill_plan,
-                               selection_to_region, window_title)
+from screen_automation import (FillCancelled, SavedSelection, ScreenRegion,
+                               fill_on_screen, load_selection,
+                               make_fill_plan, resolve_saved_region,
+                               save_selection, selection_to_region,
+                               target_at_region, window_title)
+from sudoku_screen_detect import detect_grid
 from sudoku_ocr import OCRResult, recognize_image, recognize_pil_image
 from sudoku_solver import SolveResult, Step, solve_board, validate_board, verify_solution
 
@@ -30,6 +34,7 @@ BLUE = "#2479b7"
 TEAL = "#148c80"
 ORANGE = "#c07720"
 RED = "#c74848"
+MIN_AUTO_FILL_GIVENS = 17
 
 
 def _font_path() -> str | None:
@@ -98,6 +103,12 @@ class SudokuStudio(tk.Tk):
         self.screen_region: ScreenRegion | None = None
         self.screen_corners = None
         self.screen_reference: Image.Image | None = None
+        local_data = os.environ.get("LOCALAPPDATA") if sys.platform == "win32" else None
+        self.selection_path = (Path(local_data) / "SudokuStudio" / "last_selection.json"
+                               if local_data else None)
+        self.saved_selection = (load_selection(self.selection_path)
+                                if self.selection_path else None)
+        self.pending_selection: SavedSelection | None = None
         self.fill_stopped = threading.Event()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.original_image: ImageTk.PhotoImage | None = None
@@ -145,22 +156,24 @@ class SudokuStudio(tk.Tk):
         head.pack(fill="x", padx=14, pady=(10, 4))
         tk.Label(head, text="SUDOKU STUDIO", bg=BG, fg=INK,
                  font=("Arial", 18, "bold")).pack(anchor="w")
-        tk.Label(head, text="框选 · 识别 · 求解 · 自动填写", bg=BG, fg=MUTED,
+        tk.Label(head, text="自动定位 · 识别 · 求解 · 填写", bg=BG, fg=MUTED,
                  font=("Microsoft YaHei", 9)).pack(anchor="w")
 
         actions = tk.Frame(body, bg=BG)
         actions.pack(fill="x", padx=14, pady=(4, 3))
-        self.select_button = ttk.Button(actions, text="框选屏幕数独并自动填写",
-                                        style="Accent.TButton", command=self.select_screen)
+        self.select_button = ttk.Button(actions, text="开始填写",
+                                        style="Accent.TButton", command=self.start_fill)
         self.select_button.pack(fill="x", pady=(0, 5))
         other = tk.Frame(actions, bg=BG)
         other.pack(fill="x")
-        ttk.Button(other, text="读取剪贴板", command=self.read_clipboard).pack(
+        ttk.Button(other, text="重新框选", command=self.select_screen).pack(
             side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(other, text="读取剪贴板", command=self.read_clipboard).pack(
+            side="left", fill="x", expand=True, padx=3)
         ttk.Button(other, text="打开图片", command=self.open_image).pack(
             side="left", fill="x", expand=True, padx=(3, 0))
 
-        self.status = tk.StringVar(value="点击框选按钮，拖动鼠标圈住完整的数独棋盘")
+        self.status = tk.StringVar(value="点击『开始填写』自动寻找屏幕上的数独棋盘")
         tk.Label(body, textvariable=self.status, bg=BG, fg=MUTED,
                  font=("Microsoft YaHei", 9), justify="left",
                  wraplength=self.window_width - 38).pack(fill="x", padx=14, pady=(2, 3))
@@ -323,6 +336,53 @@ class SudokuStudio(tk.Tk):
         if path:
             self.load_image(path)
 
+    def start_fill(self) -> None:
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "屏幕自动填写目前只支持 Windows。")
+            return
+        if self.busy:
+            messagebox.showinfo("稍等", "正在处理上一项任务。")
+            return
+        self._stop_play()
+        self.withdraw()
+        self.status.set("正在扫描屏幕上的数独棋盘…")
+        self.after(250, self._scan_screen)
+
+    def _scan_screen(self) -> None:
+        try:
+            screenshot = ImageGrab.grab()
+            preferred = ((self.saved_selection.left, self.saved_selection.top,
+                          self.saved_selection.right, self.saved_selection.bottom)
+                         if self.saved_selection else None)
+            detected = detect_grid(screenshot, preferred)
+            candidate = None
+            if detected:
+                try:
+                    region = target_at_region(ScreenRegion(*detected.box, 0))
+                except ValueError:
+                    detected = None
+                else:
+                    title = window_title(region.target_hwnd)
+                    if title:
+                        candidate = SavedSelection.from_region(region, screenshot.size, title)
+                    label = "屏幕自动定位"
+            if not detected and self.saved_selection:
+                region = resolve_saved_region(self.saved_selection, screenshot.size)
+                label = "上次框选区域"
+            elif not detected:
+                raise ValueError("没有找到清晰的数独方格，请点击『重新框选』。")
+            cropped = screenshot.crop((region.left, region.top, region.right, region.bottom))
+            self.deiconify()
+            self.lift()
+            self._begin_recognition(cropped, label, auto_solve=True,
+                                    auto_fill=True, screen_region=region,
+                                    saved_candidate=candidate)
+        except Exception as exc:
+            self.deiconify()
+            self.lift()
+            self.status.set(str(exc))
+            messagebox.showinfo("未找到数独棋盘", str(exc))
+
     def select_screen(self) -> None:
         if sys.platform != "win32":
             messagebox.showinfo("提示", "屏幕自动填写目前只支持 Windows。")
@@ -336,7 +396,6 @@ class SudokuStudio(tk.Tk):
 
     def _show_screen_selector(self) -> None:
         try:
-            target_hwnd = foreground_window()
             screenshot = ImageGrab.grab()
             logical_width, logical_height = self.winfo_screenwidth(), self.winfo_screenheight()
             overlay = tk.Toplevel(self)
@@ -347,7 +406,7 @@ class SudokuStudio(tk.Tk):
                                highlightthickness=0, cursor="crosshair")
             canvas.pack(fill="both", expand=True)
             backdrop = screenshot.resize((logical_width, logical_height), Image.Resampling.BILINEAR)
-            overlay.backdrop = ImageTk.PhotoImage(backdrop)
+            overlay.backdrop = ImageTk.PhotoImage(backdrop, master=overlay)
             canvas.create_image(0, 0, anchor="nw", image=overlay.backdrop)
             canvas.create_rectangle(0, 0, logical_width, 37, fill="#172437", outline="")
             canvas.create_text(14, 19, anchor="w", fill="white",
@@ -377,17 +436,29 @@ class SudokuStudio(tk.Tk):
                 if selection["start"] is None:
                     return
                 overlay.destroy()
-                self.deiconify()
-                self.lift()
                 try:
                     region = selection_to_region(selection["start"], (event.x, event.y),
                                                  screenshot.size,
-                                                 (logical_width, logical_height), target_hwnd)
+                                                 (logical_width, logical_height), 0)
+                    region = target_at_region(region)
                 except ValueError as exc:
+                    self.deiconify()
+                    self.lift()
                     messagebox.showinfo("框选范围不合适", str(exc))
                     return
                 cropped = screenshot.crop((region.left, region.top,
                                            region.right, region.bottom))
+                self.deiconify()
+                self.lift()
+                title = window_title(region.target_hwnd)
+                if title:
+                    self.saved_selection = SavedSelection.from_region(
+                        region, screenshot.size, title)
+                    if self.selection_path:
+                        try:
+                            save_selection(self.selection_path, self.saved_selection)
+                        except OSError:
+                            pass
                 self._begin_recognition(cropped, "屏幕框选", auto_solve=True,
                                         auto_fill=True, screen_region=region)
 
@@ -419,12 +490,15 @@ class SudokuStudio(tk.Tk):
 
     def _begin_recognition(self, source: str | Image.Image, label: str, auto_solve: bool,
                            auto_fill: bool = False,
-                           screen_region: ScreenRegion | None = None) -> None:
+                           screen_region: ScreenRegion | None = None,
+                           saved_candidate: SavedSelection | None = None) -> None:
         if self.busy:
             messagebox.showinfo("稍等", "正在处理上一项任务。")
             return
         self._stop_play()
         self.busy = True
+        self.screen_needs_review = False
+        self.pending_selection = saved_candidate
         self.screen_region = screen_region
         self.screen_corners = None
         self.screen_reference = source.copy() if screen_region and isinstance(source, Image.Image) else None
@@ -494,7 +568,8 @@ class SudokuStudio(tk.Tk):
                 fill_on_screen(actions, self.screen_region.target_hwnd,
                                self.fill_stopped,
                                lambda count, total: self.events.put(("fill_progress", (count, total))),
-                               region=self.screen_region, reference=self.screen_reference)
+                               region=self.screen_region, reference=self.screen_reference,
+                               corners=self.screen_corners)
                 self.events.put(("fill_done", len(actions)))
             except FillCancelled as exc:
                 self.events.put(("fill_cancelled", str(exc)))
@@ -522,29 +597,46 @@ class SudokuStudio(tk.Tk):
                     self.screen_needs_review = auto_fill and bool(result.uncertain)
                     preview = Image.fromarray(result.warped[:, :, ::-1])
                     preview.thumbnail((240, self.preview_height))
-                    self.original_image = ImageTk.PhotoImage(preview)
+                    self.original_image = ImageTk.PhotoImage(preview, master=self)
                     self.preview.configure(image=self.original_image, text="", height=self.preview_height)
                     count = sum(bool(v) for v in result.board)
-                    self.status.set(f"已识别 {count} 个数字；建议核对棋盘后求解")
+                    self.status.set(f"已识别 {count} 个数字；" +
+                                    ("正在自动求解并填写" if auto_fill else "建议核对棋盘后求解"))
                     lines = [f"识别得到 {count} 个数字，空格 {81-count} 个。"]
                     if result.uncertain:
                         locations = ", ".join(f"R{i//9+1}C{i%9+1}" for i in result.uncertain[:16])
                         lines.append(f"低置信度区域：{locations}")
-                    lines.append("识别完成。点击某格即可纠正数字。")
+                    lines.append("识别完成，准备自动求解并填写。" if auto_fill
+                                 else "识别完成。点击某格即可纠正数字。")
                     self._log(lines)
                     if auto_solve:
-                        try:
-                            validate_board(self.givens)
-                        except ValueError as exc:
-                            self.status.set("识别结果有冲突，请修正数字后点击生成求解步骤")
-                            self._log([str(exc), "修正棋盘后点击『生成求解步骤』。"])
+                        if auto_fill and count < MIN_AUTO_FILL_GIVENS:
+                            self.pending_selection = None
+                            self.status.set(f"仅识别到 {count} 个数字，自动填写已停止；请重新框选")
+                            self._log([f"仅识别到 {count} 个数字，可能未框住完整棋盘。",
+                                       "请点击『重新框选』后再试。"])
                         else:
-                            safe_to_fill = auto_fill and not self.screen_needs_review
-                            self.start_solve(auto_play=not auto_fill, auto_fill=safe_to_fill)
-                            if self.screen_needs_review:
-                                self.status.set("部分数字识别置信度低：请核对后点击『填写到屏幕』")
+                            try:
+                                validate_board(self.givens)
+                            except ValueError as exc:
+                                self.pending_selection = None
+                                self.status.set("识别结果有冲突，请修正数字后点击生成求解步骤")
+                                self._log([str(exc), "修正棋盘后点击『生成求解步骤』。"])
+                            else:
+                                self.start_solve(auto_play=not auto_fill,
+                                                 auto_fill=auto_fill and not self.screen_needs_review)
+                                if self.screen_needs_review:
+                                    self.status.set("有数字识别意见不一致，请核对后点击『填写到屏幕』")
                 elif kind == "solve_ok":
                     self.result = payload
+                    if self.pending_selection:
+                        self.saved_selection = self.pending_selection
+                        if self.selection_path:
+                            try:
+                                save_selection(self.selection_path, self.saved_selection)
+                            except OSError:
+                                pass
+                        self.pending_selection = None
                     self.steps = self.result.steps
                     self.index = 0
                     self._update_step()
@@ -557,7 +649,7 @@ class SudokuStudio(tk.Tk):
                     if self.screen_region is not None:
                         self.fill_button.state(["!disabled"])
                     if self.screen_needs_review:
-                        self.status.set("部分数字识别置信度低：核对棋盘后点击『填写到屏幕』")
+                        self.status.set("有数字识别意见不一致，请核对后点击『填写到屏幕』")
                     if self.auto_fill_after_solve:
                         self.auto_fill_after_solve = False
                         self.after(300, self.start_screen_fill)
@@ -577,6 +669,7 @@ class SudokuStudio(tk.Tk):
                         if kind == "fill_error":
                             messagebox.showerror("自动填写失败", str(payload))
                 else:
+                    self.pending_selection = None
                     self.status.set(str(payload))
                     messagebox.showerror("提示", str(payload))
         except queue.Empty:

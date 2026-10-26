@@ -1,6 +1,7 @@
 """Build a self-contained Windows folder with the OCR runtime."""
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
 
 project = Path(SPECPATH)
@@ -11,10 +12,14 @@ if not (tesseract / "tesseract.exe").exists():
 datas = [
     (str(project / "example_sudoku.png"), "."),
     (str(project / "licenses" / "Tesseract_LICENSE.txt"), "licenses"),
+    (str(project / "licenses" / "RapidOCR_LICENSE.txt"), "licenses"),
+    (str(project / "licenses" / "PaddleOCR_LICENSE.txt"), "licenses"),
+    (str(project / "licenses" / "ONNXRuntime_LICENSE.txt"), "licenses"),
     (str(tesseract / "tessdata" / "eng.traineddata"), "tesseract/tessdata"),
     (str(tesseract / "tesseract.exe"), "tesseract"),
 ]
 datas.extend((str(path), "tesseract") for path in tesseract.glob("*.dll"))
+datas.extend(collect_data_files("rapidocr"))
 
 analysis = Analysis(
     [str(project / "sudoku_studio.py")],
@@ -45,3 +50,4 @@ coll = COLLECT(
     upx=False,
     name="SudokuStudio",
 )
+

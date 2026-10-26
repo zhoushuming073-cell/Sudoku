@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import pytesseract
 from PIL import Image, ImageDraw, ImageFont
+from rapidocr import RapidOCR
 
 
 @dataclass
@@ -154,6 +155,7 @@ def _normalize_glyph(image: np.ndarray) -> np.ndarray:
 
 
 _TEMPLATE_CACHE: list[tuple[int, np.ndarray]] | None = None
+_RAPID_ENGINE: RapidOCR | None = None
 
 
 def _templates() -> list[tuple[int, np.ndarray]]:
@@ -203,7 +205,21 @@ def _match_printed_digit(patch: np.ndarray) -> tuple[int, float]:
     return best_digit, best_score
 
 
+def _rapid_digit(patch: np.ndarray) -> tuple[int, float]:
+    global _RAPID_ENGINE
+    if _RAPID_ENGINE is None:
+        _RAPID_ENGINE = RapidOCR(params={"Global.use_det": False,
+                                          "Global.use_cls": False,
+                                          "Global.log_level": "error"})
+    result = _RAPID_ENGINE(patch, use_det=False, use_cls=False)
+    text = result.txts[0].strip() if result.txts else ""
+    if re.fullmatch(r"[1-9]", text):
+        return int(text), float(result.scores[0])
+    return 0, 0.0
+
+
 def _read_digit(patch: np.ndarray) -> tuple[int, float]:
+    rapid_digit, rapid_confidence = _rapid_digit(patch)
     config = "--oem 3 --psm 10 -c tessedit_char_whitelist=123456789"
     data = pytesseract.image_to_data(patch, config=config,
                                     output_type=pytesseract.Output.DICT)
@@ -215,13 +231,22 @@ def _read_digit(patch: np.ndarray) -> tuple[int, float]:
     tesseract_digit, tesseract_conf = max(possibilities, key=lambda pair: pair[1]) if possibilities else (0, 0.0)
     template_digit, similarity = _match_printed_digit(patch)
 
-    # Robust printed-font matching generally beats Tesseract on isolated thin
-    # digits (especially 4/5/6/9). Keep a high-confidence OCR result when the
-    # template similarity is weak; mark disagreements for manual inspection.
+    if rapid_digit:
+        disagreement = ((tesseract_digit and tesseract_conf >= 80 and
+                         tesseract_digit != rapid_digit) or
+                        (template_digit and similarity >= .57 and
+                         template_digit != rapid_digit))
+        score = rapid_confidence * 100
+        if rapid_confidence < .96 or disagreement:
+            score = min(score, 50.0)
+        return rapid_digit, score
+
+    # Keep legacy readers as a fallback, but require manual review if the
+    # primary model cannot produce one clear digit.
     if similarity >= 0.43:
         if tesseract_digit and tesseract_digit != template_digit and tesseract_conf >= 85:
             return tesseract_digit, min(tesseract_conf, 50.0)
-        return template_digit, 90.0 if similarity >= 0.63 else 60.0
+        return template_digit, 50.0
     if tesseract_digit:
         return tesseract_digit, min(tesseract_conf, 54.0)
     return 0, 0.0

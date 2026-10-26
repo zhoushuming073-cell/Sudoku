@@ -1,12 +1,47 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
-from screen_automation import ScreenRegion, make_fill_plan, selection_to_region
+from screen_automation import (FillAction, SavedSelection, ScreenRegion,
+                               _enter_and_verify, load_selection,
+                               make_fill_plan, missing_fill_actions, resolve_saved_region,
+                               save_selection, selection_to_region)
+from sudoku_ocr import recognize_pil_image
 from sudoku_solver import parse_board, solve_board
 
 
 class ScreenAutomationTests(unittest.TestCase):
+    def test_confirmed_blank_cell_is_retried_once(self):
+        actions = [FillAction(0, 7, 100, 100), FillAction(1, 5, 200, 100)]
+        entered = []
+        progress = []
+        with patch("screen_automation.missing_fill_actions",
+                   side_effect=[[actions[0]], [actions[0]], []]) as check:
+            _enter_and_verify(actions,
+                              lambda action, count, click, key: entered.append((action, click, key)),
+                              lambda count, total: progress.append((count, total)),
+                              lambda: Image.new("RGB", (10, 10)),
+                              np.zeros((4, 2), dtype=np.float32), lambda seconds: None)
+        self.assertEqual([item[0] for item in entered],
+                         [actions[0], actions[1], actions[0]])
+        self.assertEqual(entered[-1][1:], (.22, .22))
+        self.assertEqual(progress[-1], (2, 2))
+        self.assertEqual(check.call_count, 3)
+
+    def test_saved_selection_survives_restart_and_rejects_display_change(self):
+        selection = SavedSelection.from_region(
+            ScreenRegion(200, 100, 1000, 900, 123), (2560, 1600), "Sudoku")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "last_selection.json"
+            save_selection(path, selection)
+            self.assertEqual(load_selection(path), selection)
+            with self.assertRaisesRegex(ValueError, "屏幕尺寸"):
+                resolve_saved_region(load_selection(path), (1920, 1080))
+
     def test_selection_uses_physical_screenshot_pixels(self):
         region = selection_to_region((500, 450), (100, 50),
                                      (2560, 1600), (1280, 800), 123)
@@ -40,6 +75,26 @@ class ScreenAutomationTests(unittest.TestCase):
                            dtype=np.float32)
         with self.assertRaises(ValueError):
             make_fill_plan(givens, solution, region, corners)
+
+    def test_post_input_check_only_retries_cells_still_blank(self):
+        image = Image.open(Path(__file__).resolve().parents[1] /
+                           "example_sudoku.png").convert("RGB")
+        result = recognize_pil_image(image)
+        region = ScreenRegion(0, 0, image.width, image.height, 123)
+        actions = make_fill_plan(result.board, solve_board(result.board).solution,
+                                 region, result.corners)
+        self.assertEqual(missing_fill_actions(image, result.corners, actions), actions)
+        first = actions[0]
+        draw = ImageDraw.Draw(image)
+        font_path = (r"C:\Windows\Fonts\arial.ttf" if Path(r"C:\Windows\Fonts\arial.ttf").exists()
+                     else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        font = ImageFont.truetype(font_path, 70)
+        box = draw.textbbox((0, 0), str(first.digit), font=font)
+        draw.text((first.x-(box[2]-box[0])/2, first.y-(box[3]-box[1])/2-box[1]),
+                  str(first.digit), fill="#26384f", font=font)
+        remaining = missing_fill_actions(image, result.corners, actions)
+        self.assertEqual(len(remaining), len(actions)-1)
+        self.assertNotIn(first, remaining)
 
 
 if __name__ == "__main__":
