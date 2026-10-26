@@ -80,4 +80,3 @@ python -m unittest discover -s tests -v
 ```
 
 建议优先使用清晰截图，确保整个9×9边框完整显示。程序完全在本机处理图片，不会上传用户图片。
-
