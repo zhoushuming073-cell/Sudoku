@@ -21,6 +21,7 @@ class OCRResult:
     confidence: list[float]
     warped: np.ndarray
     uncertain: list[int]
+    corners: np.ndarray
 
 
 def configure_tesseract() -> None:
@@ -53,8 +54,8 @@ def _order_corners(points: np.ndarray) -> np.ndarray:
                      p[np.argmax(s)], p[np.argmax(d)]], dtype=np.float32)
 
 
-def rectify_grid(image: np.ndarray, size: int = 900) -> np.ndarray:
-    """Use large, nearly-square quadrilateral; fall back to the image bounds."""
+def rectify_grid_with_corners(image: np.ndarray, size: int = 900) -> tuple[np.ndarray, np.ndarray]:
+    """Return the rectified board and its corners in the source image."""
     if image is None or image.size == 0:
         raise ValueError("无法读取图片，请选择PNG、JPG或BMP图片。")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -91,7 +92,13 @@ def rectify_grid(image: np.ndarray, size: int = 900) -> np.ndarray:
     target = np.array([[0, 0], [size - 1, 0],
                        [size - 1, size - 1], [0, size - 1]], dtype=np.float32)
     transform = cv2.getPerspectiveTransform(corners, target)
-    return cv2.warpPerspective(image, transform, (size, size), flags=cv2.INTER_CUBIC)
+    warped = cv2.warpPerspective(image, transform, (size, size), flags=cv2.INTER_CUBIC)
+    return warped, corners
+
+
+def rectify_grid(image: np.ndarray, size: int = 900) -> np.ndarray:
+    """Use a large square outline, falling back to the image bounds."""
+    return rectify_grid_with_corners(image, size)[0]
 
 
 def _digit_patch(cell: np.ndarray) -> np.ndarray | None:
@@ -233,7 +240,7 @@ def recognize_pil_image(image: Image.Image) -> OCRResult:
 
 def recognize_frame(image: np.ndarray) -> OCRResult:
     configure_tesseract()
-    warped = rectify_grid(image)
+    warped, corners = rectify_grid_with_corners(image)
     board, confidence, uncertain = [], [], []
     cell_size = warped.shape[0] // 9
     for row in range(9):
@@ -250,4 +257,5 @@ def recognize_frame(image: np.ndarray) -> OCRResult:
             confidence.append(score)
             if score < 55.0:
                 uncertain.append(row*9+col)
-    return OCRResult(board, confidence, warped, uncertain)
+    return OCRResult(board, confidence, warped, uncertain, corners)
+
