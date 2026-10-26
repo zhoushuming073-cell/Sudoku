@@ -14,7 +14,7 @@
 
 ## Windows 可执行版
 
-在 [Releases](https://github.com/zhoushuming073-cell/Sudoku/releases/latest) 下载 `SudokuStudio_Windows.zip` 并解压。
+在 [Releases](https://github.com/zhoushuming073-cell/Sudoku/releases/latest) 下载 `SudokuStudio_Portable.exe` 单文件版，或下载 `SudokuStudio_Windows.zip` 文件夹版并解压。单文件版首次启动会释放临时文件，启动稍慢。
 
 在打包输出的 `SudokuStudio` 文件夹中双击 `SudokuStudio.exe`。整个文件夹需要一起保留，不能只移动 exe；可执行版已包含 Python 依赖和 OCR 引擎。
 
@@ -23,6 +23,7 @@
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pyinstaller
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm SudokuStudio.spec
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm SudokuStudio_Portable.spec
 ```
 
 ## 安装（Windows / macOS / Linux）
@@ -80,3 +81,4 @@ python -m unittest discover -s tests -v
 ```
 
 建议优先使用清晰截图，确保整个9×9边框完整显示。程序完全在本机处理图片，不会上传用户图片。
+
