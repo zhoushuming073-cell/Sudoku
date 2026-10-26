@@ -15,6 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk
 
+from screen_automation import (FillCancelled, ScreenRegion, fill_on_screen,
+                               foreground_window, make_fill_plan,
+                               selection_to_region, window_title)
 from sudoku_ocr import OCRResult, recognize_image, recognize_pil_image
 from sudoku_solver import SolveResult, Step, solve_board, validate_board, verify_solution
 
@@ -70,14 +73,14 @@ class SudokuStudio(tk.Tk):
         super().__init__()
         self.title("Sudoku Studio · 图片识别与动态求解")
         work_width, work_height = self._working_size()
-        self.window_width = min(1100, max(900, work_width - 40))
+        self.window_width = min(420, max(340, work_width - 40))
         self.window_height = min(710, max(620, work_height - 36))
-        self.geometry(f"{self.window_width}x{self.window_height}+{max(0, (work_width-self.window_width)//2)}+0")
-        self.minsize(min(900, self.window_width), min(620, self.window_height))
-        self.board_pad = 10
-        self.cell = min(55, max(42, (self.window_height - 210) // 9))
+        self.geometry(f"{self.window_width}x{self.window_height}+{max(0, work_width-self.window_width-16)}+0")
+        self.minsize(min(340, self.window_width), min(560, self.window_height))
+        self.board_pad = 8
+        self.cell = min(40, max(30, (self.window_width - 44) // 9))
         self.board_size = self.cell * 9 + self.board_pad * 2
-        self.preview_height = min(195, max(150, self.window_height - 520))
+        self.preview_height = 150
         self.configure(bg=BG)
 
         self.board = [0]*81
@@ -90,6 +93,12 @@ class SudokuStudio(tk.Tk):
         self.timer: str | None = None
         self.busy = False
         self.auto_play_on_solve = False
+        self.auto_fill_after_solve = False
+        self.screen_needs_review = False
+        self.screen_region: ScreenRegion | None = None
+        self.screen_corners = None
+        self.screen_reference: Image.Image | None = None
+        self.fill_stopped = threading.Event()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.original_image: ImageTk.PhotoImage | None = None
 
@@ -120,84 +129,96 @@ class SudokuStudio(tk.Tk):
         style.configure("TLabel", background=BG, foreground=INK, font=("Microsoft YaHei", 10))
 
     def _build(self) -> None:
-        head = tk.Frame(self, bg=BG)
-        head.pack(fill="x", padx=20, pady=(12, 8))
-        tk.Label(head, text="SUDOKU  STUDIO", bg=BG, fg=INK,
-                 font=("Arial", 19, "bold")).pack(side="left")
-        tk.Label(head, text="图片识别  ·  可编辑  ·  推理动画  ·  回溯可视化",
-                 bg=BG, fg=MUTED, font=("Microsoft YaHei", 10)).pack(side="left", padx=22, pady=8)
+        scroll = tk.Canvas(self, bg=BG, highlightthickness=0)
+        scroll.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=scroll.yview)
+        scrollbar.pack(side="right", fill="y")
+        scroll.configure(yscrollcommand=scrollbar.set)
+        body = tk.Frame(scroll, bg=BG)
+        body_id = scroll.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda event: scroll.configure(scrollregion=scroll.bbox("all")))
+        scroll.bind("<Configure>", lambda event: scroll.itemconfigure(body_id, width=event.width))
+        self.bind_all("<MouseWheel>",
+                      lambda event: scroll.yview_scroll(-int(event.delta / 120), "units"))
 
-        main = tk.Frame(self, bg=BG)
-        main.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        head = tk.Frame(body, bg=BG)
+        head.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(head, text="SUDOKU STUDIO", bg=BG, fg=INK,
+                 font=("Arial", 18, "bold")).pack(anchor="w")
+        tk.Label(head, text="框选 · 识别 · 求解 · 自动填写", bg=BG, fg=MUTED,
+                 font=("Microsoft YaHei", 9)).pack(anchor="w")
 
-        left = tk.Frame(main, bg=CARD, highlightbackground="#e1e9f1", highlightthickness=1)
-        left.pack(side="left", fill="y", padx=(0, 14))
-        left.configure(width=270)
-        left.pack_propagate(False)
+        actions = tk.Frame(body, bg=BG)
+        actions.pack(fill="x", padx=14, pady=(4, 3))
+        self.select_button = ttk.Button(actions, text="框选屏幕数独并自动填写",
+                                        style="Accent.TButton", command=self.select_screen)
+        self.select_button.pack(fill="x", pady=(0, 5))
+        other = tk.Frame(actions, bg=BG)
+        other.pack(fill="x")
+        ttk.Button(other, text="读取剪贴板", command=self.read_clipboard).pack(
+            side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(other, text="打开图片", command=self.open_image).pack(
+            side="left", fill="x", expand=True, padx=(3, 0))
 
-        tk.Label(left, text="01 / 图片输入", bg=CARD, fg=INK,
-                 font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", padx=14, pady=(12, 8))
-        self.preview = tk.Label(left, bg="#edf2f8", fg=MUTED, width=24, height=9,
-                                text="选择数独图片\n支持PNG、JPG、BMP")
-        self.preview.pack(padx=14, fill="x")
-        ttk.Button(left, text="读取剪贴板截图并求解", style="Accent.TButton",
-                   command=self.read_clipboard).pack(fill="x", padx=14, pady=(10, 5))
-        ttk.Button(left, text="打开图片并识别", style="Accent.TButton",
-                   command=self.open_image).pack(fill="x", padx=14, pady=(0, 5))
-        ttk.Button(left, text="清空棋盘，手动输入", command=self.clear_board).pack(fill="x", padx=14)
+        self.status = tk.StringVar(value="点击框选按钮，拖动鼠标圈住完整的数独棋盘")
+        tk.Label(body, textvariable=self.status, bg=BG, fg=MUTED,
+                 font=("Microsoft YaHei", 9), justify="left",
+                 wraplength=self.window_width - 38).pack(fill="x", padx=14, pady=(2, 3))
 
-        tk.Label(left, text="02 / 识别说明", bg=CARD, fg=INK,
-                 font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 6))
-        explanation = ("点击右侧格子后按 1–9 修改；\n"
-                       "按 0 / Delete / Backspace 清空。\n"
-                       "已知数字若有识别错误，请先修正。\n"
-                       "蓝色为算法填数，橙色为试探分支。")
-        tk.Label(left, text=explanation, justify="left", bg=CARD, fg=MUTED,
-                 font=("Microsoft YaHei", 9), wraplength=240).pack(anchor="w", padx=14)
-
-        tk.Label(left, text="03 / 算法日志", bg=CARD, fg=INK,
-                 font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 6))
-        self.log = tk.Text(left, height=5, wrap="word", state="disabled",
-                           bg="#f7f9fc", fg="#475569", relief="flat", padx=9, pady=8,
-                           font=("Microsoft YaHei", 9))
-        self.log.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-
-        right = tk.Frame(main, bg=BG)
-        right.pack(side="left", fill="both", expand=True)
-        toolbar = tk.Frame(right, bg=BG)
-        toolbar.pack(fill="x")
-        self.status = tk.StringVar(value="先截图，再点击左侧按钮读取剪贴板")
-        tk.Label(toolbar, textvariable=self.status, bg=BG, fg=MUTED,
-                 font=("Microsoft YaHei", 10)).pack(side="left", pady=(0, 8))
-
-        self.canvas = tk.Canvas(right, width=self.board_size, height=self.board_size, bg=CARD,
-                                highlightthickness=0, cursor="hand2")
-        self.canvas.pack(anchor="center", pady=(3, 6))
+        self.canvas = tk.Canvas(body, width=self.board_size, height=self.board_size,
+                                bg=CARD, highlightthickness=0, cursor="hand2")
+        self.canvas.pack(anchor="center", pady=(2, 5))
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Key>", self._on_key)
         self.bind_all("<Control-v>", lambda event: self.read_clipboard())
         self._draw_board()
 
-        controls = tk.Frame(right, bg=BG)
-        controls.pack(fill="x", pady=(4, 4))
-        ttk.Button(controls, text="生成求解步骤", style="Accent.TButton",
-                   command=self.start_solve).pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="◀ 上一步", command=self.previous).pack(side="left", padx=4)
-        self.play_button = ttk.Button(controls, text="▶ 播放", command=self.toggle_play)
-        self.play_button.pack(side="left", padx=4)
-        ttk.Button(controls, text="下一步 ▶", command=self.next_step).pack(side="left", padx=4)
-        ttk.Button(controls, text="导出答案", command=self.save_solution).pack(side="left", padx=4)
+        solve_row = tk.Frame(body, bg=BG)
+        solve_row.pack(fill="x", padx=14, pady=(2, 4))
+        ttk.Button(solve_row, text="生成求解步骤", style="Accent.TButton",
+                   command=self.start_solve).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.fill_button = ttk.Button(solve_row, text="填写到屏幕",
+                                      command=self.start_screen_fill)
+        self.fill_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self.fill_button.state(["disabled"])
 
-        footer = tk.Frame(right, bg=BG)
-        self.footer = footer
-        footer.pack(fill="x", pady=(4, 0))
+        playback = tk.Frame(body, bg=BG)
+        playback.pack(fill="x", padx=14, pady=(0, 4))
+        ttk.Button(playback, text="◀ 上一步", command=self.previous).pack(
+            side="left", fill="x", expand=True, padx=(0, 3))
+        self.play_button = ttk.Button(playback, text="▶ 播放", command=self.toggle_play)
+        self.play_button.pack(side="left", fill="x", expand=True, padx=3)
+        ttk.Button(playback, text="下一步 ▶", command=self.next_step).pack(
+            side="left", fill="x", expand=True, padx=(3, 0))
+
+        tools = tk.Frame(body, bg=BG)
+        tools.pack(fill="x", padx=14, pady=(0, 5))
+        ttk.Button(tools, text="清空棋盘", command=self.clear_board).pack(side="left")
+        ttk.Button(tools, text="导出答案", command=self.save_solution).pack(
+            side="left", padx=(5, 0))
         self.progress = tk.StringVar(value="步骤 0 / 0")
-        tk.Label(footer, textvariable=self.progress, bg=BG, fg=INK,
-                 font=("Microsoft YaHei", 10)).pack(side="left")
-        tk.Label(footer, text="播放间隔(ms)", bg=BG, fg=MUTED).pack(side="left", padx=(25, 8))
+        tk.Label(tools, textvariable=self.progress, bg=BG, fg=INK,
+                 font=("Microsoft YaHei", 9)).pack(side="right")
+
+        speed_row = tk.Frame(body, bg=BG)
+        speed_row.pack(fill="x", padx=14, pady=(0, 9))
+        tk.Label(speed_row, text="播放间隔", bg=BG, fg=MUTED).pack(side="left")
         self.speed = tk.DoubleVar(value=320)
-        ttk.Scale(footer, from_=70, to=1200, orient="horizontal", variable=self.speed,
-                  length=175).pack(side="left")
+        ttk.Scale(speed_row, from_=70, to=1200, orient="horizontal",
+                  variable=self.speed).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        tk.Label(body, text="识别预览", bg=BG, fg=INK,
+                 font=("Microsoft YaHei", 11, "bold")).pack(anchor="w", padx=14)
+        self.preview = tk.Label(body, bg="#edf2f8", fg=MUTED, width=24, height=7,
+                                text="图片识别后显示在这里")
+        self.preview.pack(fill="x", padx=14, pady=(5, 11))
+
+        tk.Label(body, text="算法日志", bg=BG, fg=INK,
+                 font=("Microsoft YaHei", 11, "bold")).pack(anchor="w", padx=14)
+        self.log = tk.Text(body, height=6, wrap="word", state="disabled",
+                           bg="#f7f9fc", fg="#475569", relief="flat", padx=9, pady=8,
+                           font=("Microsoft YaHei", 9))
+        self.log.pack(fill="x", padx=14, pady=(5, 14))
 
     def _draw_board(self) -> None:
         self.canvas.delete("all")
@@ -253,6 +274,7 @@ class SudokuStudio(tk.Tk):
         self.result = None
         self.index = 0
         self.progress.set("步骤 0 / 0")
+        self.fill_button.state(["disabled"])
         self._draw_board()
 
     def _on_click(self, event: tk.Event) -> None:
@@ -278,10 +300,15 @@ class SudokuStudio(tk.Tk):
             return
         self.givens[self.selected] = number
         self.board = self.givens.copy()
+        self.screen_needs_review = False
         self._invalidate()
         self.status.set("已手动编辑格子。完成后点击『生成求解步骤』")
 
     def clear_board(self) -> None:
+        self.screen_region = None
+        self.screen_corners = None
+        self.screen_reference = None
+        self.screen_needs_review = False
         self.givens = [0]*81
         self.board = self.givens.copy()
         self.selected = None
@@ -295,6 +322,84 @@ class SudokuStudio(tk.Tk):
                                                      ("全部文件", "*.*")])
         if path:
             self.load_image(path)
+
+    def select_screen(self) -> None:
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "屏幕自动填写目前只支持 Windows。")
+            return
+        if self.busy:
+            messagebox.showinfo("稍等", "正在处理上一项任务。")
+            return
+        self._stop_play()
+        self.withdraw()
+        self.after(250, self._show_screen_selector)
+
+    def _show_screen_selector(self) -> None:
+        try:
+            target_hwnd = foreground_window()
+            screenshot = ImageGrab.grab()
+            logical_width, logical_height = self.winfo_screenwidth(), self.winfo_screenheight()
+            overlay = tk.Toplevel(self)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            overlay.geometry(f"{logical_width}x{logical_height}+0+0")
+            canvas = tk.Canvas(overlay, width=logical_width, height=logical_height,
+                               highlightthickness=0, cursor="crosshair")
+            canvas.pack(fill="both", expand=True)
+            backdrop = screenshot.resize((logical_width, logical_height), Image.Resampling.BILINEAR)
+            overlay.backdrop = ImageTk.PhotoImage(backdrop)
+            canvas.create_image(0, 0, anchor="nw", image=overlay.backdrop)
+            canvas.create_rectangle(0, 0, logical_width, 37, fill="#172437", outline="")
+            canvas.create_text(14, 19, anchor="w", fill="white",
+                               text="拖动框选完整数独外边框 · 按 Esc 取消",
+                               font=("Microsoft YaHei", 11))
+            selection = {"start": None, "rectangle": None}
+
+            def cancel(event=None) -> None:
+                overlay.destroy()
+                self.deiconify()
+                self.lift()
+                self.status.set("已取消屏幕框选")
+
+            def press(event) -> None:
+                selection["start"] = (event.x, event.y)
+                if selection["rectangle"] is not None:
+                    canvas.delete(selection["rectangle"])
+                selection["rectangle"] = canvas.create_rectangle(
+                    event.x, event.y, event.x, event.y, outline="#f15a45", width=3)
+
+            def drag(event) -> None:
+                if selection["start"] is not None:
+                    x, y = selection["start"]
+                    canvas.coords(selection["rectangle"], x, y, event.x, event.y)
+
+            def release(event) -> None:
+                if selection["start"] is None:
+                    return
+                overlay.destroy()
+                self.deiconify()
+                self.lift()
+                try:
+                    region = selection_to_region(selection["start"], (event.x, event.y),
+                                                 screenshot.size,
+                                                 (logical_width, logical_height), target_hwnd)
+                except ValueError as exc:
+                    messagebox.showinfo("框选范围不合适", str(exc))
+                    return
+                cropped = screenshot.crop((region.left, region.top,
+                                           region.right, region.bottom))
+                self._begin_recognition(cropped, "屏幕框选", auto_solve=True,
+                                        auto_fill=True, screen_region=region)
+
+            canvas.bind("<ButtonPress-1>", press)
+            canvas.bind("<B1-Motion>", drag)
+            canvas.bind("<ButtonRelease-1>", release)
+            overlay.bind("<Escape>", cancel)
+            overlay.focus_force()
+        except Exception as exc:
+            self.deiconify()
+            self.lift()
+            messagebox.showerror("无法框选屏幕", str(exc))
 
     def read_clipboard(self) -> None:
         try:
@@ -312,26 +417,34 @@ class SudokuStudio(tk.Tk):
     def load_image(self, path: str, auto_solve: bool = False) -> None:
         self._begin_recognition(path, Path(path).name, auto_solve)
 
-    def _begin_recognition(self, source: str | Image.Image, label: str, auto_solve: bool) -> None:
+    def _begin_recognition(self, source: str | Image.Image, label: str, auto_solve: bool,
+                           auto_fill: bool = False,
+                           screen_region: ScreenRegion | None = None) -> None:
         if self.busy:
             messagebox.showinfo("稍等", "正在处理上一项任务。")
             return
         self._stop_play()
         self.busy = True
+        self.screen_region = screen_region
+        self.screen_corners = None
+        self.screen_reference = source.copy() if screen_region and isinstance(source, Image.Image) else None
         self.status.set("正在定位九宫格并识别81个格子，请稍等…")
-        self._log([f"正在识别：{label}", "OCR过程可能持续数秒。"])
+        lines = [f"正在识别：{label}", "OCR过程可能持续数秒。"]
+        if screen_region:
+            lines.append(f"目标窗口：{window_title(screen_region.target_hwnd) or '未命名窗口'}")
+        self._log(lines)
 
         def worker() -> None:
             try:
                 result = (recognize_image(source) if isinstance(source, str)
                           else recognize_pil_image(source))
-                self.events.put(("ocr_ok", (result, auto_solve)))
+                self.events.put(("ocr_ok", (result, auto_solve, auto_fill)))
             except Exception as exc:
                 self.events.put(("error", f"图片识别失败：{exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_solve(self, auto_play: bool = False) -> None:
+    def start_solve(self, auto_play: bool = False, auto_fill: bool = False) -> None:
         if self.busy:
             return
         self._stop_play()
@@ -345,6 +458,7 @@ class SudokuStudio(tk.Tk):
             return
         self.busy = True
         self.auto_play_on_solve = auto_play
+        self.auto_fill_after_solve = auto_fill
         self.status.set("约束传播 + MRV回溯搜索中…")
         starting = self.givens.copy()
 
@@ -357,17 +471,55 @@ class SudokuStudio(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def start_screen_fill(self) -> None:
+        if self.busy or self.result is None or self.screen_region is None or self.screen_corners is None:
+            return
+        try:
+            actions = make_fill_plan(self.givens, self.result.solution,
+                                     self.screen_region, self.screen_corners)
+        except ValueError as exc:
+            messagebox.showerror("无法自动填写", str(exc))
+            return
+        if not actions:
+            self.status.set("棋盘已填满，无需自动填写")
+            return
+        self._stop_play()
+        self.busy = True
+        self.fill_stopped.clear()
+        self.status.set(f"准备填写 {len(actions)} 格；切换窗口或按住 Esc 可停止")
+        self.withdraw()
+
+        def worker() -> None:
+            try:
+                fill_on_screen(actions, self.screen_region.target_hwnd,
+                               self.fill_stopped,
+                               lambda count, total: self.events.put(("fill_progress", (count, total))),
+                               region=self.screen_region, reference=self.screen_reference)
+                self.events.put(("fill_done", len(actions)))
+            except FillCancelled as exc:
+                self.events.put(("fill_cancelled", str(exc)))
+            except Exception as exc:
+                self.events.put(("fill_error", str(exc)))
+
+        self.after(250, lambda: threading.Thread(target=worker, daemon=True).start())
+
     def _poll_events(self) -> None:
         try:
             while True:
                 kind, payload = self.events.get_nowait()
+                if kind == "fill_progress":
+                    count, total = payload
+                    self.status.set(f"正在填写屏幕数独：{count}/{total} 格；按住 Esc 可停止")
+                    continue
                 self.busy = False
                 if kind == "ocr_ok":
-                    result, auto_solve = payload
+                    result, auto_solve, auto_fill = payload
                     self.givens = result.board.copy()
                     self.board = self.givens.copy()
                     self.selected = None
                     self._invalidate()
+                    self.screen_corners = result.corners if self.screen_region else None
+                    self.screen_needs_review = auto_fill and bool(result.uncertain)
                     preview = Image.fromarray(result.warped[:, :, ::-1])
                     preview.thumbnail((240, self.preview_height))
                     self.original_image = ImageTk.PhotoImage(preview)
@@ -387,7 +539,10 @@ class SudokuStudio(tk.Tk):
                             self.status.set("识别结果有冲突，请修正数字后点击生成求解步骤")
                             self._log([str(exc), "修正棋盘后点击『生成求解步骤』。"])
                         else:
-                            self.start_solve(auto_play=True)
+                            safe_to_fill = auto_fill and not self.screen_needs_review
+                            self.start_solve(auto_play=not auto_fill, auto_fill=safe_to_fill)
+                            if self.screen_needs_review:
+                                self.status.set("部分数字识别置信度低：请核对后点击『填写到屏幕』")
                 elif kind == "solve_ok":
                     self.result = payload
                     self.steps = self.result.steps
@@ -399,9 +554,28 @@ class SudokuStudio(tk.Tk):
                                f"搜索节点数：{self.result.nodes}",
                                f"试探次数：{self.result.guesses}",
                                f"回溯次数：{self.result.backtracks}"])
+                    if self.screen_region is not None:
+                        self.fill_button.state(["!disabled"])
+                    if self.screen_needs_review:
+                        self.status.set("部分数字识别置信度低：核对棋盘后点击『填写到屏幕』")
+                    if self.auto_fill_after_solve:
+                        self.auto_fill_after_solve = False
+                        self.after(300, self.start_screen_fill)
                     if self.auto_play_on_solve:
                         self.auto_play_on_solve = False
                         self.toggle_play()
+                elif kind in ("fill_done", "fill_cancelled", "fill_error"):
+                    self.deiconify()
+                    self.lift()
+                    self.fill_button.state(["disabled"])
+                    if kind == "fill_done":
+                        self.status.set(f"已自动填写 {payload} 个空格；请核对目标页面")
+                        self._log([f"屏幕自动填写完成：{payload} 个空格。"])
+                    else:
+                        self.status.set(str(payload))
+                        self._log([str(payload)])
+                        if kind == "fill_error":
+                            messagebox.showerror("自动填写失败", str(payload))
                 else:
                     self.status.set(str(payload))
                     messagebox.showerror("提示", str(payload))
@@ -480,3 +654,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
