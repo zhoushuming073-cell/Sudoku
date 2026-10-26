@@ -24,6 +24,7 @@ class SudokuOCRTests(unittest.TestCase):
             "500270084", "604138207", "802900600",
         ]
         self.assertEqual("".join(map(str, observed.board)), "".join(expected))
+        self.assertEqual(observed.corners.shape, (4, 2))
         result = solve_board(observed.board)
         self.assertTrue(verify_solution(observed.board, result.solution))
 
@@ -41,3 +42,4 @@ class SudokuOCRTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
