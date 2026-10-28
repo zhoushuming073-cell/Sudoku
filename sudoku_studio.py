@@ -568,8 +568,7 @@ class SudokuStudio(tk.Tk):
                 fill_on_screen(actions, self.screen_region.target_hwnd,
                                self.fill_stopped,
                                lambda count, total: self.events.put(("fill_progress", (count, total))),
-                               region=self.screen_region, reference=self.screen_reference,
-                               corners=self.screen_corners)
+                               region=self.screen_region, reference=self.screen_reference)
                 self.events.put(("fill_done", len(actions)))
             except FillCancelled as exc:
                 self.events.put(("fill_cancelled", str(exc)))
@@ -661,8 +660,9 @@ class SudokuStudio(tk.Tk):
                     self.lift()
                     self.fill_button.state(["disabled"])
                     if kind == "fill_done":
-                        self.status.set(f"已自动填写 {payload} 个空格；请核对目标页面")
-                        self._log([f"屏幕自动填写完成：{payload} 个空格。"])
+                        self.status.set(f"已向 {payload} 个格子各输入一次；请核对目标页面")
+                        self._log([f"本轮输入结束：{payload} 个格子，每格只输入一次。",
+                                   "若确有漏填，可重新点击『开始填写』扫描当前棋盘。"])
                     else:
                         self.status.set(str(payload))
                         self._log([str(payload)])
@@ -747,4 +747,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

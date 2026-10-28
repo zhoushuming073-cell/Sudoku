@@ -17,7 +17,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageGrab
 
-from sudoku_ocr import _digit_patch
 from sudoku_solver import verify_solution
 
 
@@ -172,51 +171,13 @@ def make_fill_plan(givens: list[int], solution: list[int], region: ScreenRegion,
     return actions
 
 
-def missing_fill_actions(image: Image.Image, corners: np.ndarray,
-                         actions: list[FillAction]) -> list[FillAction]:
-    """Check which target cells still have no visible digit after input."""
-    raw = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    target = np.array([[0, 0], [899, 0], [899, 899], [0, 899]], dtype=np.float32)
-    transform = cv2.getPerspectiveTransform(corners.astype(np.float32), target)
-    warped = cv2.warpPerspective(raw, transform, (900, 900), flags=cv2.INTER_CUBIC)
-    missing = []
-    for action in actions:
-        row, col = divmod(action.index, 9)
-        cell = warped[row*100:(row+1)*100, col*100:(col+1)*100]
-        if _digit_patch(cell) is None:
-            missing.append(action)
-    return missing
-
-
-def _enter_and_verify(actions: list[FillAction],
-                      enter_digit: Callable[[FillAction, int, float, float], None],
-                      progress: Callable[[int, int], None],
-                      capture: Callable[[], Image.Image] | None,
-                      corners: np.ndarray | None,
-                      pause: Callable[[float], None] = time.sleep) -> None:
+def _enter_once(actions: list[FillAction],
+                enter_digit: Callable[[FillAction, int, float, float], None],
+                progress: Callable[[int, int], None]) -> None:
+    """Send each planned digit once; OCR cannot safely decide whether to retry."""
     for count, action in enumerate(actions, 1):
         enter_digit(action, count, .13, .13)
         progress(count, len(actions))
-
-    if capture is None or corners is None:
-        return
-    for retry in range(3):
-        pause(.35)
-        first_check = missing_fill_actions(capture(), corners, actions)
-        if first_check:
-            pause(.25)
-            confirmed = set(missing_fill_actions(capture(), corners, first_check))
-            missing = [action for action in first_check if action in confirmed]
-        else:
-            missing = []
-        if not missing:
-            progress(len(actions), len(actions))
-            return
-        progress(len(actions)-len(missing), len(actions))
-        if retry == 2:
-            raise RuntimeError(f"仍有 {len(missing)} 格未显示数字，请检查目标页面后重试。")
-        for action in missing:
-            enter_digit(action, len(actions)-len(missing)+1, .22, .22)
 
 
 _ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else wintypes.DWORD
@@ -305,8 +266,7 @@ def window_title(hwnd: int) -> str:
 def fill_on_screen(actions: list[FillAction], target_hwnd: int,
                    stopped: Event, progress: Callable[[int, int], None],
                    region: ScreenRegion | None = None,
-                   reference: Image.Image | None = None,
-                   corners: np.ndarray | None = None) -> None:
+                   reference: Image.Image | None = None) -> None:
     if sys.platform != "win32":
         raise RuntimeError("自动填写目前只支持 Windows。")
     if not target_hwnd or not actions:
@@ -371,7 +331,4 @@ def fill_on_screen(actions: list[FillAction], target_hwnd: int,
             _press_digit(user32, action.digit)
             time.sleep(key_delay)
 
-        capture = (lambda: ImageGrab.grab(bbox=(region.left, region.top,
-                                               region.right, region.bottom))) if region else None
-        _enter_and_verify(actions, enter_digit, progress, capture, corners)
-
+        _enter_once(actions, enter_digit, progress)
